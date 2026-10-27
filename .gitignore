@@ -6,3 +6,5 @@ __pycache__/
 venv/
 data_backup_*/
 .pytest_cache/
+scratch/
+drivers/*.bak-*

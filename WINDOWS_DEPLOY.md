@@ -1,57 +1,85 @@
-# Windows deployment (`TRANSPORT=web`)
+# استقرار روی ویندوز (`TRANSPORT=web`)
 
-Production for this project is Windows Server, Microsoft Edge, and Selenium. The Docker and systemd files are the older HTTP transport on Linux.
+روش تولید این پروژه: **Windows Server + Microsoft Edge + Selenium**. فایل‌های Docker و systemd فقط حالت قدیمی HTTP روی لینوکس هستند.
 
-## Requirements
+## پیش‌نیاز
 
-- Python 3.11+ and a `.venv`
-- Microsoft Edge and an `msedgedriver.exe` of the same version (see `HANDOFF.md`, section 7)
-- `.env` with `TRANSPORT=web` and `BROWSER=edge`
+- Python 3.11+ و محیط مجازی `.venv`
+- Microsoft Edge و `msedgedriver.exe` هم‌نسخه (طبق `HANDOFF.md` بخش ۷)
+- فایل `.env` با `TRANSPORT=web` و `BROWSER=edge`
 
-## 1. First login
+## ۱) اولین لاگین (اجباری، روی دسکتاپ واقعی)
 
-`python manage.py login` needs a visible window. Do this on a real desktop session before you install the Windows service. A service session has no desktop.
+**مهم:** `python manage.py login` به پنجرهٔ قابل‌مشاهده نیاز دارد. این کار را **قبل از نصب سرویس** و در یک نشست دسکتاپ واقعی انجام دهید — نه از داخل سرویس ویندوز که بدون دسکتاپ اجرا می‌شود.
 
 ```bat
 cd C:\path\to\project
 .venv\Scripts\python.exe manage.py login
 ```
 
-After a successful login, set:
+بعد از ورود موفق، در `.env` بگذارید:
 
 ```
 WEB_HEADLESS=true
 ```
 
-The service can then run without a visible window.
+تا سرویس بدون پنجرهٔ قابل‌مشاهده اجرا شود.
 
-## 2. Install NSSM
+## ۲) نصب NSSM
 
-Download it from [https://nssm.cc](https://nssm.cc) and put `nssm.exe` on `PATH`, for example `C:\Windows\System32`.
+از سایت رسمی دانلود کنید: [https://nssm.cc](https://nssm.cc)
 
-Replace the paths below with the real project path.
+`nssm.exe` را در PATH بگذارید (مثلاً `C:\Windows\System32`).
 
-## 3. Bot service (`EitaaBot`)
+مسیرهای زیر را با مسیر واقعی پروژه عوض کنید.
+
+## ۳) سرویس ربات (`EitaaBot`)
 
 ```bat
 nssm install EitaaBot "C:\path\to\.venv\Scripts\python.exe" "C:\path\to\main.py"
 nssm set EitaaBot AppDirectory "C:\path\to\project"
-nssm set EitaaBot AppStdout "C:\path\to\project\data\service-stdout.log"
-nssm set EitaaBot AppStderr "C:\path\to\project\data\service-stderr.log"
-nssm set EitaaBot AppRotateFiles 1
-nssm set EitaaBot Start SERVICE_AUTO_START
+nssm set EitaaBot AppExit Default Restart
+nssm set EitaaBot AppRestartDelay 10000
 nssm start EitaaBot
 ```
 
-## 4. Group panel service (`EitaaPanel`)
+وضعیت:
+
+```bat
+nssm status EitaaBot
+```
+
+توقف:
+
+```bat
+nssm stop EitaaBot
+```
+
+لاگ فایل: `data\logs\bot.log`
+
+اگر نشست مرورگر بعد از ۳ تلاش (۳۰، ۶۰، ۱۲۰ ثانیه) برنگردد، فرآیند با کد غیرصفر خارج می‌شود و NSSM دوباره آن را بالا می‌آورد.
+
+## ۴) سرویس پنل مدیریت گروه‌ها (`EitaaPanel`)
+
+پنل جدا از ربات اجرا می‌شود تا کرش یکی، دیگری را نخواباند.
 
 ```bat
 nssm install EitaaPanel "C:\path\to\.venv\Scripts\python.exe" "-m" "uvicorn" "web_panel:app" "--host" "127.0.0.1" "--port" "8088"
 nssm set EitaaPanel AppDirectory "C:\path\to\project"
-nssm set EitaaPanel Start SERVICE_AUTO_START
+nssm set EitaaPanel AppExit Default Restart
+nssm set EitaaPanel AppRestartDelay 10000
 nssm start EitaaPanel
 ```
 
-If `PANEL_PORT` in `.env` is not 8088, use that port in the `uvicorn` argument.
+اگر `PANEL_PORT` در `.env` چیز دیگری است، همان عدد را در `--port` بگذارید. `PANEL_HOST` را روی `127.0.0.1` نگه دارید مگر پشت شبکهٔ داخلی امن باشید.
 
-Panel behavior is described in `ADMIN_PANEL.md`.
+وضعیت / توقف:
+
+```bat
+nssm status EitaaPanel
+nssm stop EitaaPanel
+```
+
+راهنمای کاربری پنل: [راهنمای-پنل-مدیریت.md](راهنمای-پنل-مدیریت.md)
+
+**امنیت:** این پنل Basic Auth ساده و بدون HTTPS است. روی اینترنت عمومی باز نکنید مگر پشت reverse proxy با HTTPS (خارج از این راهنما).

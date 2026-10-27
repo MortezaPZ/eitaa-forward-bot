@@ -62,7 +62,7 @@ async def run(stop_event: asyncio.Event | None = None) -> int:
         ingestor = Ingestor(client, settings)
         router = CommandRouter(client, worker, ingestor.command_queue, settings)
     reporter = Reporter(client, settings)
-    repeater = Repeater(settings)
+    repeater = Repeater(settings, transport=client if is_web else None, worker=worker)
 
     if hasattr(client, "get_me"):
         try:
@@ -78,6 +78,21 @@ async def run(stop_event: asyncio.Event | None = None) -> int:
             await client.aclose()
             await dispose_db()
             return 1
+        # The DOM check above passes on a cached UI even after the server has
+        # dropped the session, so confirm with the server before starting any
+        # loop. Otherwise the bot runs "healthy" while every call 401s.
+        session_ok, session_error = await client.verify_api_session()
+        if not session_ok:
+            logger.error(
+                "web session is not accepted by the server (%s); "
+                "the cached UI still renders, but nothing can be sent or read. "
+                "run `python manage.py login` and sign in again",
+                session_error,
+            )
+            await client.aclose()
+            await dispose_db()
+            return 1
+        logger.info("web session verified against the server")
         await client.detect_strategy()
 
     skipped = await worker.discard_backlog()
@@ -119,13 +134,32 @@ async def run(stop_event: asyncio.Event | None = None) -> int:
 
     fatal_code = 0
 
+    # Losing any of these means the bot keeps running while doing nothing at
+    # all -- no ingestion, no fan-out, no delivery. That must never pass
+    # unnoticed, so it is logged loudly and brings the process down where a
+    # service manager (NSSM / scheduled task) can restart it. The other tasks
+    # may finish on purpose: repeater returns immediately when disabled, and
+    # window-end completes by design to trigger shutdown.
+    critical_tasks = {"ingest", "dispatcher", "sender", "repeat-sender"}
+
     def _on_task_done(task: asyncio.Task) -> None:
         nonlocal fatal_code
         if task.cancelled() or stop_event.is_set():
             return
+        name = task.get_name()
         exc = task.exception()
         if isinstance(exc, SessionUnrecoverable):
-            logger.error("session unrestorable in task %s; requesting shutdown", task.get_name())
+            logger.error("session unrestorable in task %s; requesting shutdown", name)
+            fatal_code = 1
+            stop_event.set()
+            return
+        if exc is not None:
+            logger.error("task %s died: %s", name, exc, exc_info=exc)
+        elif name in critical_tasks:
+            logger.error("task %s stopped unexpectedly without an error", name)
+        else:
+            return
+        if name in critical_tasks:
             fatal_code = 1
             stop_event.set()
 

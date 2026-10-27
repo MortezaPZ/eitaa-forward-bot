@@ -1,75 +1,227 @@
-# Eitaa Forward Bot
+# ربات بازنشر خودکار ایتا (کانال ← گروه‌ها)
 
-Forward every new post from an Eitaa channel to as many as 70 groups, after a delay, with a rate limit and a queue that survives a restart.
+هر پستی که در کانال مبدأ منتشر شود، پس از یک تأخیر قابل تنظیم، به صورت خودکار و با کنترل نرخ به لیست گروه‌ها (تا ۷۰ گروه) ارسال می‌شود.
 
-## Overview
+## امکانات
 
-The production path drives a logged-in Eitaa web session on Windows. An older HTTP bot API path still exists for Linux, but it cannot receive channel posts on the gateway that was tested. The queue, rate limit, retries, and reports are the same in both modes.
+- دریافت پست‌های جدید کانال: متن، عکس، ویدیو، فایل، صوت، ویس و آلبوم (media group)
+- ارسال آلبوم به صورت یک واحد و با ترتیب درست
+- تأخیر پیش‌فرض ۶۰ ثانیه؛ اگر پست در این بازه ادیت شود، نسخه‌ی نهایی ارسال می‌شود
+- صف پایدار در SQLite؛ با ریستارت ربات هیچ آیتمی گم نمی‌شود
+- کنترل نرخ: فاصله‌ی بین ارسال‌ها + سقف ارسال در دقیقه + jitter تصادفی
+- مدیریت خطای ۴۲۹ با backoff نمایی و احترام به `retry_after`
+- تلاش مجدد خودکار (پیش‌فرض ۳ بار با فاصله‌ی افزایشی)
+- مدیریت کامل گروه‌ها از داخل ایتا با دستورهای ادمین
+- غیرفعال‌سازی خودکار گروه‌هایی که ربات از آن‌ها اخراج شده یا اجازه‌ی ارسال ندارد + اطلاع به ادمین
+- گزارش روزانه‌ی خودکار + لاگ چرخشی روی فایل و لاگ کامل در دیتابیس
+- جلوگیری از ارسال تکراری (idempotency بر اساس `message_id` و جفت پست/گروه)
+- خاموشی تمیز با SIGTERM
 
-## Features
+## پیش‌نیاز
 
-- Text, photo, video, file, audio, voice, and albums
-- Albums stay one unit, in order, when the web session can forward the original message ids
-- Default delay of 60 seconds so an edit in that window is what gets sent
-- SQLite queue
-- Interval, a per-minute cap, and jitter
-- HTTP 429 backoff that honors `retry_after`
-- Retries (default 3, with a growing delay)
-- Admin commands, or `manage.py` when the in-app commands are unavailable
-- Groups that kick the bot, or remove send permission, are disabled and the admin is told
-- Daily report, rotating file log, and a full log in the database
-- Duplicate protection on `message_id` and on the post/group pair
-- Clean shutdown on SIGTERM
+- Python 3.11 یا بالاتر (یا Docker)
+- یک سرور اوبونتو ۲۲.۰۴ به بالا
 
-## Technology Stack
+## ۱) گرفتن توکن ربات
 
-- Python 3.11+
-- SQLAlchemy and SQLite
-- httpx for the HTTP transport
-- Selenium and Microsoft Edge for `TRANSPORT=web`
-- FastAPI panel for the group list
-- Docker and systemd only for the legacy HTTP transport
+1. در ایتا وارد ربات سازنده‌ی ربات‌ها شوید (`@eitaa_bot` یا پنل توسعه‌دهندگان ایتا).
+2. ربات جدید بسازید و توکن را دریافت کنید.
+3. توکن را در `.env` داخل `EITAA_BOT_TOKEN` بگذارید.
 
-## Architecture
+نکته درباره‌ی `EITAA_API_MODE`:
 
-| Module | Role |
+- `botapi`: اندپوینت رسمی سازگار با Telegram Bot API به شکل `https://eitaa.com/api/bot<TOKEN>/<method>`. برای دریافت پست‌های کانال (`getUpdates`) **الزامی** است.
+- `eitaayar`: درگاه `https://eitaayar.ir/api/<TOKEN>/<method>` که فقط قابلیت ارسال دارد (`sendMessage` و `sendFile`) و `getUpdates` ندارد؛ در این حالت دریافت خودکار پست‌های کانال کار نمی‌کند.
+
+## ۲) ادمین کردن ربات در کانال
+
+1. وارد کانال مبدأ شوید → مدیریت کانال → مدیران → افزودن مدیر.
+2. ربات را اضافه کنید و دسترسی خواندن پیام‌ها را بدهید.
+3. شناسه‌ی عددی کانال را در `SOURCE_CHANNEL_ID` قرار دهید (مثل `-1001234567890`). اگر شناسه‌ی عددی ندارید می‌توانید `@username` کانال را بگذارید.
+
+## ۳) افزودن ربات به گروه‌ها
+
+1. ربات را در هر گروه مقصد عضو کنید.
+2. مطمئن شوید ربات اجازه‌ی ارسال پیام و رسانه دارد (در گروه‌های با محدودیت، ربات را ادمین کنید).
+3. در چت خصوصی با ربات دستور `/add` را برای هر گروه بزنید.
+
+## ۴) نصب روی سرور اوبونتو (بدون Docker)
+
+> **هشدار:** این بخش فقط برای `TRANSPORT=http` روی لینوکس است و استقرار واقعی این پروژه (`TRANSPORT=web` روی ویندوز) نیست. روش تولید: [WINDOWS_DEPLOY.md](WINDOWS_DEPLOY.md).
+
+```bash
+sudo apt update && sudo apt install -y python3.11 python3.11-venv git
+sudo useradd -m -d /opt/eitaa-bot -s /bin/bash eitaa
+sudo mkdir -p /opt/eitaa-bot && sudo chown -R eitaa:eitaa /opt/eitaa-bot
+```
+
+```bash
+sudo -u eitaa bash -lc 'cd /opt/eitaa-bot && python3.11 -m venv venv && ./venv/bin/pip install --upgrade pip'
+```
+
+فایل‌های پروژه را در `/opt/eitaa-bot` قرار دهید، سپس:
+
+```bash
+sudo -u eitaa bash -lc 'cd /opt/eitaa-bot && ./venv/bin/pip install -r requirements.txt && cp .env.example .env'
+```
+
+مقادیر `.env` را ویرایش کنید:
+
+```bash
+sudo -u eitaa nano /opt/eitaa-bot/.env
+```
+
+اجرای آزمایشی:
+
+```bash
+sudo -u eitaa bash -lc 'cd /opt/eitaa-bot && ./venv/bin/python main.py'
+```
+
+## ۵) اجرای دائمی با systemd
+
+> **هشدار:** systemd فقط برای `TRANSPORT=http` روی لینوکس است. استقرار واقعی (`TRANSPORT=web`) با NSSM روی ویندوز است — [WINDOWS_DEPLOY.md](WINDOWS_DEPLOY.md).
+
+```bash
+sudo cp /opt/eitaa-bot/eitaa-bot.service /etc/systemd/system/eitaa-bot.service
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now eitaa-bot
+```
+
+بررسی وضعیت و لاگ:
+
+```bash
+sudo systemctl status eitaa-bot
+```
+
+```bash
+sudo journalctl -u eitaa-bot -f
+```
+
+## ۶) اجرا با Docker
+
+```bash
+cp .env.example .env
+```
+
+```bash
+docker compose up -d --build
+```
+
+```bash
+docker compose logs -f
+```
+
+دیتابیس، فایل‌های کش‌شده و لاگ‌ها در پوشه‌ی `./data` نگه‌داری می‌شوند.
+
+## دستورهای ربات
+
+این دستورها فقط در چت خصوصی و فقط برای آیدی‌های عددی موجود در `ADMIN_IDS` کار می‌کنند.
+
+| دستور | توضیح |
 | --- | --- |
-| `config.py` | Settings from `.env` and the rotating log |
-| `db.py` | Groups, posts, media, queue, log, settings |
-| `eitaa_client.py` | Async HTTP client for `botapi` and `eitaayar` |
-| `web_transport.py` | Logged-in Chrome/Edge session. Same transport contract |
-| `ingest.py` | Long polling, album assembly, file cache |
-| `queue_worker.py` | Fan-out, rate limit, send, retry |
-| `commands.py` | Admin commands |
-| `reporter.py` | Daily report |
-| `repeater.py` | Optional replay of the last N posts. Off unless enabled |
-| `main.py` | Startup and shutdown |
-| `manage.py` | CLI for the modes that have no in-app commands |
-| `web_panel.py` | Group admin panel |
+| `/add <شناسه یا لینک>` | افزودن گروه؛ شناسه‌ی عددی، `@username` یا لینک `eitaa.com/...` |
+| `/remove <شناسه>` | حذف کامل گروه از لیست |
+| `/list` | نمایش همه‌ی گروه‌ها با وضعیت و آخرین خطا |
+| `/disable <شناسه>` | غیرفعال‌سازی موقت گروه بدون حذف |
+| `/enable <شناسه>` | فعال‌سازی مجدد گروه و پاک کردن شمارنده‌ی خطا |
+| `/pause` | توقف کل ارسال‌ها (دریافت پست‌ها ادامه دارد و در صف می‌ماند) |
+| `/resume` | ادامه‌ی ارسال‌ها |
+| `/delay <ثانیه>` | تأخیر بین انتشار در کانال و ارسال به گروه‌ها |
+| `/rate <ثانیه>` | فاصله‌ی بین دو ارسال متوالی |
+| `/perminute <عدد>` | سقف ارسال در هر دقیقه |
+| `/status` | وضعیت لحظه‌ای: صف، آخرین ارسال، خطاهای اخیر |
+| `/report` | گزارش امروز |
+| `/retry` | بازگرداندن ارسال‌های شکست‌خورده به صف |
+| `/help` | راهنما |
 
-Eitaa does not offer a reliable `forwardMessage` for bots, so the HTTP path rebuilds the post from `file_id` or the cached file. Each media file is cached once under `FILES_DIR`.
+## تنظیمات مهم `.env`
 
-## Installation
+| کلید | پیش‌فرض | توضیح |
+| --- | --- | --- |
+| `SEND_DELAY_SECONDS` | `60` | تأخیر قبل از شروع ارسال هر پست |
+| `SEND_INTERVAL_SECONDS` | `1.0` | فاصله‌ی پایه بین دو ارسال |
+| `SEND_JITTER_RATIO` | `0.35` | میزان تصادفی‌سازی فاصله‌ها برای طبیعی‌تر شدن الگوی ترافیک |
+| `MAX_SENDS_PER_MINUTE` | `45` | سقف ارسال در دقیقه |
+| `MAX_RETRIES` | `3` | حداکثر تلاش مجدد برای هر ارسال |
+| `RETRY_BASE_DELAY_SECONDS` | `30` | پایه‌ی backoff نمایی |
+| `MEDIA_GROUP_WINDOW_SECONDS` | `3.0` | پنجره‌ی جمع‌آوری اجزای یک آلبوم |
+| `DAILY_REPORT_TIME` | `23:45` | ساعت ارسال گزارش روزانه |
 
-Production is Windows with `TRANSPORT=web`. The full service install is `WINDOWS_DEPLOY.md`. The group panel is `ADMIN_PANEL.md`.
+مقادیر `delay`، `rate`، `perminute` و وضعیت `pause` پس از تغییر با دستورها در دیتابیس ذخیره می‌شوند و بر مقدار `.env` اولویت دارند.
+
+## توصیه‌های ضد اسپم
+
+- `SEND_INTERVAL_SECONDS` را کمتر از ۱ ثانیه نگذارید؛ برای ۷۰ گروه، هر پست حدود ۷۰ تا ۹۵ ثانیه طول می‌کشد که کاملاً طبیعی است.
+- `MAX_SENDS_PER_MINUTE` را روی ۴۰ تا ۵۰ نگه دارید.
+- در صورت دریافت خطای ۴۲۹، ربات به صورت خودکار کل صف را متوقف می‌کند تا زمان `retry_after` بگذرد.
+- گروه‌های مشکل‌دار به صورت خودکار غیرفعال می‌شوند تا تلاش بی‌فایده تکرار نشود.
+
+## معماری فایل‌ها
+
+| فایل | نقش |
+| --- | --- |
+| `config.py` | خواندن تنظیمات از `.env` و راه‌اندازی لاگ چرخشی |
+| `db.py` | مدل‌های SQLAlchemy (گروه، پست، رسانه، صف، لاگ، تنظیمات) و کلید/مقدار تنظیمات |
+| `eitaa_client.py` | کلاینت async روی httpx، دو حالت `botapi` و `eitaayar`، دسته‌بندی خطاها |
+| `ingest.py` | long polling، تجمیع آلبوم‌ها، ذخیره‌ی پست و کش کردن فایل‌ها |
+| `queue_worker.py` | توزیع پست‌ها در صف، محدودکننده‌ی نرخ، ارسال، retry و ثبت خطا |
+| `commands.py` | دستورهای ادمین |
+| `reporter.py` | گزارش روزانه و اطلاع‌رسانی به ادمین‌ها |
+| `repeater.py` | زیرساخت آماده برای قابلیت «تکرار N پست آخر» (فعلاً غیرفعال) |
+| `main.py` | راه‌اندازی، اجرای تسک‌ها و خاموشی تمیز |
+
+## وضعیت واقعی API ایتا (تست‌شده در ۱۴۰۵/۰۵/۲۵)
+
+نتیجه‌ی تست زنده روی `https://eitaayar.ir/api/<TOKEN>/`:
+
+| متد | نتیجه |
+| --- | --- |
+| `getMe` | ✅ کار می‌کند |
+| `sendMessage` / `sendFile` | ✅ طبق مستندات رسمی ایتایار |
+| `getUpdates` | ❌ `method not found` |
+| `setWebhook` | ❌ `method not found` |
+| `getChats` | ❌ `method not found` |
+
+یعنی **ایتایار فقط ارسال دارد و هیچ راهی برای دریافت پست جدید کانال یا دریافت دستور ادمین ندارد.** مستندات رسمی ایتایار هم فقط سه متد `getMe`، `sendMessage` و `sendFile` را معرفی می‌کند.
+
+پیامد عملی:
+
+- تشخیص خودکار پست جدید کانال با توکن ایتایار ممکن نیست؛ باید پست از طریق `manage.py publish` (یا هر منبع دیگری که بعداً اضافه شود) وارد صف شود.
+- دستورهای `/add`، `/status` و... داخل ایتا فقط در حالت `EITAA_API_MODE=botapi` کار می‌کنند. در حالت ایتایار از `manage.py` استفاده کنید.
+- برای گروه‌ها، `chat_id` باید همان شناسه‌ای باشد که در پنل ایتایار برای گروه ساخته می‌شود (یا لینک دعوت گروه). گروه باید اول در پنل ایتایار ثبت شده باشد.
+
+## حالت اکانت روی سرور ویندوز (`TRANSPORT=web`)
+
+در این حالت به‌جای API، یک کروم واقعا لاگین‌شده روی `web.eitaa.com` رانده می‌شود. کد این بخش در [web_transport.py](web_transport.py) است و همان قرارداد [transport.py](transport.py) را پیاده می‌کند؛ یعنی صف، کنترل نرخ، retry، گزارش و CLI دست‌نخورده باقی می‌مانند.
+
+### راه‌اندازی
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Set `TRANSPORT=web` and `WEB_HEADLESS=false`, then:
+در `.env` مقدار `TRANSPORT=web` و `WEB_HEADLESS=false` بگذارید، سپس:
 
 ```bash
 python manage.py login
+```
+
+یک پنجره‌ی کروم باز می‌شود و **صاحب اکانت خودش** با QR یا شماره و کد وارد می‌شود. هیچ شماره یا کدی به کسی داده نمی‌شود؛ نشست در `CHROME_PROFILE_DIR` باقی می‌ماند و دفعات بعد لازم نیست.
+
+سپس وضعیت واقعی صفحه را بگیرید:
+
+```bash
 python manage.py probe
 ```
 
-`login` opens a browser. The account owner signs in. The session stays in `CHROME_PROFILE_DIR`. `probe` reports which selectors were found.
+خروجی می‌گوید کدام سلکتورها پیدا شده‌اند و کدام روش ارسال فعال است:
 
-- `strategy: js` means send goes through the page's message manager.
-- `strategy: ui` means the composer has to be clicked. That path is slower.
+- `strategy: js` یعنی صفحه شیء مدیریت پیام را در دسترس گذاشته و ارسال با یک فراخوانی جاوااسکریپت انجام می‌شود (سریع و مقاوم).
+- `strategy: ui` یعنی باید کامپوزر را کلیک و تایپ کرد (کندتر و شکننده‌تر).
 
-If a selector is `MISS`, put the correct value in `selectors.json`. No code change is required.
+اگر سلکتوری `MISS` بود، مقدار درست را در فایل `selectors.json` کنار پروژه بگذارید؛ نیازی به تغییر کد نیست:
 
 ```json
 {
@@ -78,78 +230,69 @@ If a selector is `MISS`, put the correct value in `selectors.json`. No code chan
 }
 ```
 
-The legacy Linux HTTP install is not the production path:
+### محدودیت‌های این حالت
 
-```bash
-sudo apt update && sudo apt install -y python3.11 python3.11-venv git
-sudo useradd -m -d /opt/eitaa-bot -s /bin/bash eitaa
-sudo mkdir -p /opt/eitaa-bot && sudo chown -R eitaa:eitaa /opt/eitaa-bot
-sudo -u eitaa bash -lc 'cd /opt/eitaa-bot && python3.11 -m venv venv && ./venv/bin/pip install --upgrade pip'
-sudo -u eitaa bash -lc 'cd /opt/eitaa-bot && ./venv/bin/pip install -r requirements.txt && cp .env.example .env'
-sudo cp /opt/eitaa-bot/eitaa-bot.service /etc/systemd/system/eitaa-bot.service
-sudo systemctl daemon-reload && sudo systemctl enable --now eitaa-bot
-```
+- دریافت خودکار پست کانال در حالت وب با `web_ingest.py` انجام می‌شود (polling روی `messages.getHistory`).
+- آلبوم‌های کانال با یک فراخوانی `appMessagesManager.forwardMessages` و لیست کامل `message_id`ها فوروارد می‌شوند تا در گروه هم آلبوم بمانند. پست‌هایی که از `manage.py publish` می‌آیند منبع فوروارد ندارند و اجزایشان جداگانه ارسال می‌شوند.
+- هر تغییر در رابط کاربری ایتا وب می‌تواند سلکتورها را بشکند. `probe` دقیقاً برای همین است؛ مقادیر پین‌شده در `selectors.json` هستند.
+- سرعت واقعی هر ارسال حدود ۱ تا ۵ ثانیه است (بسته به `js` یا `ui`)، پس `SEND_INTERVAL_SECONDS` را محافظه‌کارانه نگه دارید.
+- استقرار دائمی روی ویندوز است؛ جزئیات در [WINDOWS_DEPLOY.md](WINDOWS_DEPLOY.md). پنل مدیریت گروه‌ها: [راهنمای-پنل-مدیریت.md](راهنمای-پنل-مدیریت.md).
 
-Docker for that same legacy path:
+## پنل خط فرمان (`manage.py`)
 
-```bash
-cp .env.example .env
-docker compose up -d --build
-docker compose logs -f
-```
-
-Database, cache, and logs stay in `./data`.
-
-## Usage
-
-In-app commands work only in a private chat, only for ids in `ADMIN_IDS`, and only when `EITAA_API_MODE=botapi`.
-
-| Command | Effect |
-| --- | --- |
-| `/add <id or link>` | Add a group. Numeric id, `@username`, or an `eitaa.com` link |
-| `/remove <id>` | Delete the group |
-| `/list` | Groups, status, and the last error |
-| `/disable <id>` | Disable without deleting |
-| `/enable <id>` | Enable and clear the error counter |
-| `/pause` | Stop sending. Ingest keeps queueing |
-| `/resume` | Send again |
-| `/delay <seconds>` | Delay between the channel post and the fan-out |
-| `/rate <seconds>` | Gap between two sends |
-| `/perminute <number>` | Cap per minute |
-| `/status` | Queue, last send, recent errors |
-| `/report` | Today's report |
-| `/retry` | Requeue failed sends |
-| `/help` | Help |
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `SEND_DELAY_SECONDS` | `60` | Wait before a post is sent |
-| `SEND_INTERVAL_SECONDS` | `1.0` | Base gap between sends |
-| `SEND_JITTER_RATIO` | `0.35` | Randomize the gap |
-| `MAX_SENDS_PER_MINUTE` | `45` | Per-minute cap |
-| `MAX_RETRIES` | `3` | Retries per send |
-| `RETRY_BASE_DELAY_SECONDS` | `30` | Exponential backoff base |
-| `MEDIA_GROUP_WINDOW_SECONDS` | `3.0` | How long to collect an album |
-| `DAILY_REPORT_TIME` | `23:45` | Daily report clock time |
-
-CLI, including the gateway mode that has no in-app commands:
+در حالت ایتایار که دستورهای داخل ایتا در دسترس نیست، همه‌ی کارها از خط فرمان انجام می‌شود:
 
 ```bash
 python manage.py check
-python manage.py add https://eitaa.com/joinchat/XXXX --title "Group one"
-python manage.py import groups.txt
-python manage.py list
-python manage.py status
-python manage.py report
-python manage.py set delay_seconds 60
-python manage.py retry
-python manage.py publish --text "Post text"
-python manage.py publish --file photo.jpg --type photo --text "Caption"
 ```
 
-`publish` enters the same queue as channel ingest, so delay, rate limit, retry, and reports apply.
+```bash
+python manage.py add https://eitaa.com/joinchat/XXXX --title "گروه یک"
+```
 
-Optional idle replay:
+```bash
+python manage.py import groups.txt
+```
+
+```bash
+python manage.py list
+```
+
+```bash
+python manage.py status
+```
+
+```bash
+python manage.py report
+```
+
+```bash
+python manage.py set delay_seconds 60
+```
+
+```bash
+python manage.py retry
+```
+
+```bash
+python manage.py publish --text "متن پست"
+```
+
+```bash
+python manage.py publish --file photo.jpg --type photo --text "کپشن"
+```
+
+`publish` پست را دقیقاً وارد همان صفی می‌کند که ingest کانال استفاده می‌کند؛ یعنی تأخیر، کنترل نرخ، retry و گزارش‌گیری همگی یکسان اعمال می‌شوند.
+
+## نکات فنی
+
+- ایتا برای ربات‌ها `forwardMessage`/`copyMessage` قابل اتکایی ندارد؛ بنابراین محتوای پست از روی `file_id` یا فایل کش‌شده بازسازی و به صورت پیام جدید ارسال می‌شود (کامنت مربوطه در `queue_worker._send_payload`).
+- هر رسانه یک بار در `FILES_DIR` کش می‌شود تا تلاش‌های مجدد و ارسال آلبوم به معتبر بودن `file_id` وابسته نباشد.
+- اگر `sendMediaGroup` در دسترس نباشد، ربات به صورت خودکار به ارسال ترتیبی اجزای آلبوم برمی‌گردد.
+
+## فعال‌سازی آینده‌ی «تکرار خودکار»
+
+ساختار آماده است. کافی است در `.env` مقادیر زیر را تنظیم کنید:
 
 ```
 REPEAT_ENABLED=true
@@ -157,25 +300,4 @@ REPEAT_IDLE_HOURS=6
 REPEAT_LAST_N_POSTS=3
 ```
 
-The repeater checks every 5 minutes. If the channel has been idle, it copies recent posts with `dispatched=false` and the normal queue sends them.
-
-HTTP methods that were checked against the Eitaa gateway: `getMe` works. `sendMessage` and `sendFile` match the documented send API. `getUpdates`, `setWebhook`, and `getChats` returned `method not found`. Automatic channel ingest therefore uses the web session (`messages.getHistory`), not `getUpdates`.
-
-## Testing
-
-The offline suite is `pytest`. A full Selenium run needs a logged-in desktop session and is not part of the default test command.
-
-## Limitations
-
-- The admin panel is Basic Auth without HTTPS. Use it on a private network. See `ADMIN_PANEL.md`.
-- `composer` and `file_input` are absent from the DOM until a chat is open. `probe` can report `MISS` immediately after load even when the selector is right.
-- Web forward needs a numeric peer id. A group stored only as an invite link has to be resolved first.
-- A web UI change can break selectors. Pin replacements in `selectors.json`.
-- A real send takes about 1 to 5 seconds. Keep `SEND_INTERVAL_SECONDS` conservative.
-- Posts created with `manage.py publish` have no source message ids, so their album parts are sent separately.
-- Chromedriver downloads are geo-blocked from Iran. The working browser is Microsoft Edge, and `msedgedriver` must match the installed Edge version.
-- `tzdata` is required on Windows.
-
-## License
-
-See the repository license file if one is present.
+`Repeater` هر ۵ دقیقه بررسی می‌کند و در صورت بی‌فعالیتی، کپی پست‌های اخیر را با `dispatched=false` در دیتابیس می‌سازد تا مسیر عادی صف آن‌ها را ارسال کند.

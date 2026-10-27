@@ -129,6 +129,28 @@ class QueueWorker:
             ).scalars().all()
 
             for post in posts:
+                bundling = (
+                    self.settings.bundle_enabled
+                    and self.settings.bundle_previous_count > 0
+                    and bool(post.message_id)
+                    and post.message_id > 0
+                )
+                post.dispatched = True
+                post.dispatched_at = utcnow()
+
+                await self._cancel_pending_idle_repeats(session)
+
+                if bundling:
+                    # The new post belongs to the same batch as its
+                    # predecessors. Queued separately it went out through the
+                    # other sender loop, which runs concurrently, so it landed
+                    # in the middle of the batch and broke both the per-group
+                    # grouping and the channel order.
+                    queued = await self._queue_context_bundle(session, post, groups)
+                    created += queued
+                    logger.info("dispatched post %s to %d groups (bundled)", post.id, len(groups))
+                    continue
+
                 existing = set(
                     (
                         await session.execute(
@@ -141,40 +163,85 @@ class QueueWorker:
                         continue  # idempotency: never queue the same pair twice
                     session.add(QueueItem(post_id=post.id, group_id=group.id))
                     created += 1
-                post.dispatched = True
-                post.dispatched_at = utcnow()
                 logger.info("dispatched post %s to %d groups", post.id, len(groups))
-
-                await self._cancel_pending_idle_repeats(session)
-                if self.settings.bundle_enabled and post.message_id and post.message_id > 0:
-                    await self._queue_context_bundle(session, post, groups)
         return created
 
     async def _cancel_pending_idle_repeats(self, session: Any) -> int:
-        """A genuinely new channel post supersedes any not-yet-sent idle-repeat
-        batch — the client wants the old batch dropped, not delivered alongside
-        the new post. Only touches idle-repeater rows (round < BUNDLE_ROUND_OFFSET);
-        context-bundle rows for THIS post are added after this call and must
-        survive it untouched.
+        """A new channel post clears everything still waiting to go out.
+
+        The client's rule: when a post arrives, drop the whole outstanding
+        queue and schedule afresh. On a news channel that sometimes publishes
+        twice in two minutes, anything still queued is about to be overtaken
+        anyway, and delivering it alongside the new post is what made groups
+        look like they were being spammed with old items.
+
+        Both producers are cleared -- the idle repeater's batches and any
+        earlier post's bundle -- along with plain queue items. This runs before
+        the new post's own batch is queued, so that batch is untouched.
         """
-        result = await session.execute(
+        # Only 'pending'. An item already in 'sending' is mid-flight in the
+        # browser and its own finaliser owns the outcome; overwriting it here
+        # would either be lost or record a delivery that did happen as skipped.
+        repeats = await session.execute(
             update(RepeatItem)
-            .where(
-                RepeatItem.status == "pending",
-                RepeatItem.round < BUNDLE_ROUND_OFFSET,
-            )
+            .where(RepeatItem.status == "pending")
             .values(status="skipped", last_error="cancelled: newer channel post arrived")
         )
-        cancelled = int(result.rowcount or 0)
+        queued = await session.execute(
+            update(QueueItem)
+            .where(QueueItem.status == "pending")
+            .values(status="skipped", last_error="cancelled: newer channel post arrived")
+        )
+        cancelled = int(repeats.rowcount or 0) + int(queued.rowcount or 0)
         if cancelled:
             logger.info(
-                "cancelled %d pending idle-repeat items: newer post superseded them",
+                "cleared %d queued items: a newer channel post supersedes them",
                 cancelled,
             )
         return cancelled
 
-    async def _queue_context_bundle(self, session: Any, post: Post, groups: list[Group]) -> None:
-        """Re-sends the N most recent predecessors alongside a new post.
+    async def ensure_channel_post(self, session: Any, message_id: int) -> Post | None:
+        """A Post row for a channel message, created on demand if unseen.
+
+        Bundles and idle repeats now name channel messages directly, and most
+        of those were never ingested — they were published while the bot was
+        down. Forwarding only needs the source chat and the message id, so a
+        stub row is enough to carry one through the existing queue. It is
+        marked dispatched so the normal fan-out never treats it as new.
+        """
+        if message_id <= 0:
+            return None
+        source = str(self.settings.source_channel_id)
+        existing = (
+            await session.execute(
+                select(Post).where(
+                    Post.source_chat_id == source, Post.message_id == message_id
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        post = Post(
+            source_chat_id=source,
+            message_id=message_id,
+            kind="text",
+            text=None,
+            ready_at=utcnow(),
+            dispatched=True,
+            dispatched_at=utcnow(),
+        )
+        session.add(post)
+        await session.flush()
+        return post
+
+    async def _queue_context_bundle(self, session: Any, post: Post, groups: list[Group]) -> int:
+        """Re-sends the N messages that precede this post in the channel.
+
+        The predecessors come from the channel itself, not from `posts`. The
+        table only holds what was ingested while the bot was up, so reading it
+        meant "the 9 rows before this one", which after a few outages was
+        messages sixty and three hundred places back in the real channel --
+        week-old items arriving beside today's news.
 
         Uses RepeatItem (not QueueItem) on purpose: QueueItem's uniqueness
         means a predecessor already delivered once would never be queued
@@ -184,21 +251,32 @@ class QueueWorker:
         """
         n = self.settings.bundle_previous_count
         if n <= 0:
-            return
-        predecessors = (
-            await session.execute(
-                select(Post)
-                .where(Post.id < post.id, Post.message_id > 0)
-                .order_by(Post.id.desc())
-                .limit(n)
+            return 0
+        if not hasattr(self.client, "get_channel_message_ids"):
+            return 0
+        try:
+            ids = await self.client.get_channel_message_ids(
+                str(self.settings.source_channel_id),
+                before_id=post.message_id,
+                limit=n,
             )
-        ).scalars().all()
-        if not predecessors:
-            return
+        except Exception as exc:
+            logger.warning("could not read channel history for the bundle: %s", exc)
+            return 0
+        predecessors = []
+        for message_id in ids:
+            row = await self.ensure_channel_post(session, message_id)
+            if row is not None:
+                predecessors.append(row)
+        # The batch is the new post together with the ones before it, so a
+        # group receives all ten from a single ordered stream.
+        batch = predecessors + [post]
+        if not batch:
+            return 0
 
         round_ = BUNDLE_ROUND_OFFSET + post.id
         created = 0
-        for predecessor in predecessors:
+        for predecessor in batch:
             for group in groups:
                 exists = (
                     await session.execute(
@@ -214,9 +292,11 @@ class QueueWorker:
                 session.add(RepeatItem(post_id=predecessor.id, group_id=group.id, round=round_))
                 created += 1
         logger.info(
-            "context bundle for post %s: queued %d items (%d predecessors x %d groups)",
+            "context bundle for post %s: queued %d items "
+            "(%d predecessors + the post itself x %d groups)",
             post.id, created, len(predecessors), len(groups),
         )
+        return created
 
     # -------------------------------------------------------------------- sender
 
@@ -283,12 +363,30 @@ class QueueWorker:
                 await self._sleep(2.0)
 
     async def _claim_next_repeat_item(self) -> RepeatItem | None:
+        """Next repeat to send, group by group rather than post by post.
+
+        Ordering by (round, group, message id) finishes a whole batch for one
+        group before starting the next, so a group receives its ten messages
+        together and in the order the channel published them, instead of one
+        message every forty groups.
+
+        The sort key has to be Post.message_id, not post_id. Stub rows are
+        created in the order the channel returns history -- newest first -- so
+        row id ascending is message id *descending*, and sorting by row id
+        delivered 17567, 17568, 17572, 17569, ... 17563.
+        """
         async with session_scope() as session:
             item = (
                 await session.execute(
                     select(RepeatItem)
+                    .join(Post, Post.id == RepeatItem.post_id)
                     .where(RepeatItem.status == "pending", RepeatItem.next_attempt_at <= utcnow())
-                    .order_by(RepeatItem.next_attempt_at, RepeatItem.id)
+                    .order_by(
+                        RepeatItem.round,
+                        RepeatItem.group_id,
+                        Post.message_id,
+                        RepeatItem.id,
+                    )
                     .limit(1)
                 )
             ).scalar_one_or_none()
@@ -349,16 +447,34 @@ class QueueWorker:
     async def _finalize_repeat(
         self, item: RepeatItem, *, ok: bool, error: str | None, permanent: bool = False
     ) -> None:
-        # Deliberately does not touch Group.status/enabled — the normal queue
-        # already owns group health tracking; repeats just log their own outcome.
         async with session_scope() as session:
             row = await session.get(RepeatItem, item.id)
             if row is None:
                 return
+            # Repeats are most of the outbound traffic once bundling is on (nine
+            # predecessors per new post), and the daily report counts SendLog
+            # rows. Without this the report told the client "0 sent" on a night
+            # that delivered 421 messages.
+            session.add(
+                SendLog(
+                    queue_item_id=None,
+                    post_id=row.post_id,
+                    group_id=row.group_id,
+                    ok=ok,
+                    error=None if ok else (error or "unknown error")[:1000],
+                )
+            )
+            group = await session.get(Group, row.group_id)
             if ok:
                 row.status = "done"
                 row.sent_at = utcnow()
                 row.last_error = None
+                if group is not None:
+                    group.fail_count = 0
+                    group.last_sent_at = utcnow()
+                    if group.status != "active":
+                        group.status = "active"
+                        group.last_error = None
             else:
                 row.last_error = (error or "unknown error")[:1000]
                 if permanent or row.attempts >= self.settings.max_retries:
@@ -367,6 +483,18 @@ class QueueWorker:
                     row.status = "pending"
                     backoff = self.settings.retry_base_delay_seconds * (2 ** (row.attempts - 1))
                     row.next_attempt_at = utcnow() + dt.timedelta(seconds=min(backoff, 3600))
+                # With bundling on, every delivery runs through this path, so
+                # it has to own group health too -- otherwise a group that has
+                # kicked the account is never disabled and is retried forever.
+                if group is not None:
+                    group.fail_count += 1
+                    group.last_error = row.last_error
+                    group.last_error_at = utcnow()
+                    if permanent:
+                        group.status = "kicked"
+                        group.enabled = False
+                    elif group.fail_count >= 10 and group.status == "active":
+                        group.status = "error"
         if not ok:
             self.recent_errors.append(f"repeat: {error}"[:150])
 

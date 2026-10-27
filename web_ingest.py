@@ -62,7 +62,30 @@ class WebIngestor:
         logger.info("startup: skipping offline history, baselining at message_id=%s", baseline)
 
     async def run(self) -> None:
-        await self.skip_offline_history()
+        # Baselining must succeed before polling starts: poll_once() would
+        # otherwise resume from a stale web_last_message_id and re-ingest every
+        # post published while the bot was down. A transient browser fault here
+        # used to escape run() and kill the ingest task for the whole process
+        # lifetime, leaving a bot that logged "bot started" and then silently
+        # forwarded nothing -- so retry instead of dying.
+        attempt = 0
+        while not self._stop.is_set():
+            try:
+                await self.transport.ensure_session()
+                await self.skip_offline_history()
+                break
+            except SessionUnrecoverable:
+                raise
+            except Exception:
+                attempt += 1
+                delay = min(60.0, 5.0 * attempt)
+                logger.exception(
+                    "startup baseline failed (attempt %d); retrying in %.0fs", attempt, delay
+                )
+                await self._sleep(delay)
+        if self._stop.is_set():
+            return
+
         while not self._stop.is_set():
             if not is_within_active_window(self.settings):
                 await self._sleep(5.0)
@@ -95,13 +118,21 @@ class WebIngestor:
                 message: m.message || null,
                 has_media: !!m.media,
                 media_type: m.media ? m.media._ : null,
-            }}))).catch(e => ({{error: String(e && e.message || e)}}));
+            }}))).catch(e => ({{
+                error: (e && (e.type || e.error_message || e.message)) || 'UNKNOWN',
+                code: (e && (e.code || e.error_code)) || null,
+            }}));
             """
             return driver.execute_script(script)
 
         result = await self.transport._run(_fetch, op="getHistory")  # noqa: SLF001
         if isinstance(result, dict) and "error" in result:
-            raise RuntimeError(f"getHistory failed: {result['error']}")
+            # Telegram API errors are plain objects with `type`/`code` and no
+            # `message`, so stringifying them yielded a useless "[object
+            # Object]" that hid INVALID_LOGIN for days.
+            code = result.get("code")
+            suffix = f" (code {code})" if code else ""
+            raise RuntimeError(f"getHistory failed: {result['error']}{suffix}")
         return list(result or [])
 
     # ----------------------------------------------------------------- polling

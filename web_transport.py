@@ -37,6 +37,23 @@ from eitaa_client import EitaaError
 logger = logging.getLogger("eitaa.web")
 
 
+def _numeric_peer_id(value: Any, what: str) -> int:
+    """Peer ids must be numeric here: the web client forwards by peer id, and
+    an @username was never resolved to one. Fail as a permanent error instead
+    of letting int() raise a bare ValueError that the queue reports as an
+    "unexpected" fault and keeps retrying."""
+    raw = str(value).strip()
+    try:
+        return int(raw.lstrip("@"))
+    except ValueError as exc:
+        raise EitaaError(
+            f"{what} {raw!r} is not a numeric peer id; "
+            "resolve it to its numeric id (see manage.py) and update the group",
+            permanent=True,
+        ) from exc
+
+
+
 class SessionUnrecoverable(RuntimeError):
     """Browser session could not be restored; the process must exit nonzero."""
 
@@ -89,6 +106,12 @@ class WebTransport:
         self.strategy: str | None = None
         self._driver: Any = None
         self._lock = asyncio.Lock()
+        # Recovery is serialised separately from driver access: three loops
+        # call ensure_session, and without this they all tore down and
+        # rebuilt the same browser at once, each undoing the others'
+        # progress -- the log showed "session restored" and "session lost"
+        # in the same second.
+        self._recovery_lock = asyncio.Lock()
         self._js_manager = "appMessagesManager"
 
     # The queue asks this to decide whether to try album sends; the web client
@@ -245,6 +268,44 @@ class WebTransport:
 
         return await self._run(_check)
 
+    async def verify_api_session(self) -> tuple[bool, str | None]:
+        """Ask the server whether this session's auth key is still valid.
+
+        :meth:`is_logged_in` only looks at the DOM, and the web client renders
+        its chat list straight out of IndexedDB — so a session the server has
+        already invalidated still paints a full, convincing UI. Relying on the
+        DOM alone means the bot logs "logged in: True", starts every loop, and
+        only then discovers that each API call comes back 401 INVALID_LOGIN.
+
+        Returns (ok, error_type); error_type is the Telegram error string
+        (INVALID_LOGIN, AUTH_KEY_UNREGISTERED, SESSION_REVOKED, ...) or None.
+        """
+        driver = self._require_driver()
+
+        def _check() -> Any:
+            driver.set_script_timeout(45)
+            script = """
+            const cb = arguments[arguments.length - 1];
+            try {
+              apiManager.invokeApi('users.getUsers', {id: [{_: 'inputUserSelf'}]})
+                .then(function (r) { cb({ok: !!(r && r[0])}); })
+                .catch(function (e) {
+                  cb({ok: false, type: (e && (e.type || e.error_message)) || 'UNKNOWN'});
+                });
+            } catch (e) { cb({ok: false, type: 'NO_API_MANAGER'}); }
+            """
+            return driver.execute_async_script(script)
+
+        try:
+            result = await self._run(_check, op="verify_session")
+        except Exception as exc:
+            logger.warning("session verification could not run: %s", exc)
+            return False, "VERIFY_FAILED"
+        if isinstance(result, dict) and result.get("ok"):
+            return True, None
+        error_type = (result or {}).get("type") if isinstance(result, dict) else "UNKNOWN"
+        return False, error_type
+
     async def _healthy(self) -> bool:
         if self._driver is None:
             return False
@@ -263,6 +324,13 @@ class WebTransport:
         if await self._healthy():
             return
 
+        async with self._recovery_lock:
+            # Another loop may have rebuilt the browser while this one waited.
+            if await self._healthy():
+                return
+            await self._restart_session()
+
+    async def _restart_session(self) -> None:
         delays = (30.0, 60.0, 120.0)
         for attempt, delay in enumerate(delays, start=1):
             logger.error(
@@ -483,44 +551,211 @@ class WebTransport:
     ) -> Any:
         raise EitaaError("web transport has no album endpoint", permanent=True)
 
+    # --------------------------------------------------------- invite resolving
+
+    async def resolve_invite_hashes(self, hashes: Sequence[str]) -> dict[str, Any]:
+        """Turn eitaa.com/joinchat hashes into numeric peer ids.
+
+        Everything downstream forwards by numeric peer id, and an invite link
+        carries none. For a chat the account has already joined the server
+        answers `chatInviteAlready` with the chat itself, which is where the id
+        comes from; resolving also teaches the web client about the peer, so
+        groups that previously answered PEER_ID_INVALID can become reachable.
+
+        Returns {hash: {"id": int, "title": str}} for what resolved and
+        {hash: {"error": str}} for what did not, so the caller can report the
+        bad links rather than silently dropping them.
+        """
+        await self.ensure_session()
+        driver = self._require_driver()
+
+        def _resolve() -> Any:
+            driver.set_script_timeout(300)
+            script = """
+            const cb = arguments[arguments.length - 1];
+            const hashes = arguments[0];
+            (async () => {
+              const out = {};
+              for (const h of hashes) {
+                try {
+                  const r = await apiManager.invokeApi('messages.checkChatInvite', {hash: h});
+                  if ((r._ === 'chatInviteAlready' || r._ === 'chatInvitePeek') && r.chat) {
+                    out[h] = {id: r.chat.id, title: r.chat.title || '', joined: true};
+                  } else {
+                    // A plain chatInvite means the account is not in that chat.
+                    out[h] = {error: 'not a member', title: r.title || ''};
+                  }
+                } catch (e) {
+                  out[h] = {error: (e && (e.type || e.error_message)) || String(e)};
+                }
+                await new Promise(r => setTimeout(r, 120));  // stay polite
+              }
+              cb(out);
+            })();
+            """
+            return driver.execute_async_script(script, list(hashes))
+
+        result = await self._run(_resolve, op="resolve_invites")
+        return result if isinstance(result, dict) else {}
+
+    # ----------------------------------------------------------- channel reads
+
+    async def get_channel_message_ids(
+        self,
+        peer_id: str,
+        *,
+        before_id: int | None = None,
+        skip: int = 0,
+        limit: int = 10,
+    ) -> list[int]:
+        """The channel's own recent message ids, newest first.
+
+        The bot's `posts` table is a poor stand-in for channel history: it only
+        holds what was ingested while the bot happened to be running, and every
+        restart skips whatever was published during the downtime. After a few
+        outages it held 87 rows against a channel that had published 17,569
+        messages, so "the 9 posts before this one" resolved to messages that
+        were sixty and three hundred places back in the real channel. Anything
+        that means "recent posts" has to ask the channel.
+
+        `before_id` returns only messages older than that id, `skip` walks
+        further back in blocks (round 1 wants 10..20), and empty or service
+        messages are dropped so a batch of 10 is 10 real posts.
+        """
+        await self.ensure_session()
+        driver = self._require_driver()
+        peer = _numeric_peer_id(peer_id, "source channel")
+
+        def _fetch() -> Any:
+            script = """
+            const cb = arguments[arguments.length - 1];
+            const peer = arguments[0], beforeId = arguments[1];
+            const skip = arguments[2], want = arguments[3];
+            (async () => {
+              try {
+                const out = [];
+                let offsetId = beforeId || 0;
+                let guard = 0;
+                // Over-fetch: service and empty messages do not count towards
+                // the batch, and skipping blocks needs the ones before them.
+                while (out.length < skip + want && guard++ < 12) {
+                  const r = await apiManager.invokeApi('messages.getHistory', {
+                    peer: appPeersManager.getInputPeerById(peer),
+                    offset_id: offsetId, offset_date: 0, add_offset: 0,
+                    limit: 100, max_id: 0, min_id: 0, hash: 0});
+                  const msgs = r.messages || [];
+                  if (!msgs.length) break;
+                  for (const m of msgs) {
+                    if (m._ === 'messageEmpty' || m._ === 'messageService') continue;
+                    if (!m.message && !m.media) continue;
+                    out.push(m.id);
+                  }
+                  offsetId = msgs[msgs.length - 1].id;
+                }
+                cb({ok: true, ids: out.slice(skip, skip + want)});
+              } catch (e) {
+                cb({ok: false, error: (e && (e.type || e.error_message || e.message)) || String(e)});
+              }
+            })();
+            """
+            return driver.execute_async_script(script, peer, int(before_id or 0), int(skip), int(limit))
+
+        result = await self._run(_fetch, op="channel_history")
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = result.get("error") if isinstance(result, dict) else str(result)
+            raise EitaaError(f"reading channel history failed: {error}")
+        return [int(i) for i in (result.get("ids") or [])]
+
     # ------------------------------------------------------------------- forward
 
     async def forward_message(
         self, from_peer_id: str, message_ids: Sequence[int], to_peer_id: str
     ) -> Any:
-        """Native forward of every id in one call, preserving albums.
+        """Forward every id in one server call, preserving albums.
 
-        Live web.eitaa.com (2026-08-20) exposes
-        ``appMessagesManager.forwardMessages(toPeer, fromPeer, ids)``. That
-        function sorts the ids, keeps same-``grouped_id`` parts together, and
-        then invokes ``messages.forwardMessages`` once. Sending ids one-by-one
-        would break the album; this path never does that.
+        Goes straight at ``messages.forwardMessages`` through ``apiManager``
+        rather than the web client's ``appMessagesManager.forwardMessages``
+        wrapper, for two reasons found the hard way:
+
+        * The wrapper forwards out of the client's local message cache and
+          takes its *internal* mids, not server message ids. Ingest reads
+          history through ``apiManager``, which never fills that cache, so the
+          wrapper looked up nothing and died inside the client with "Cannot
+          read properties of undefined (reading 'isUser')". The raw call takes
+          the server ids we already store, so none of that applies.
+        * The wrapper resolves once the outgoing message is queued locally,
+          which is not proof the server took it. The raw call returns the
+          server's own Updates, so a success here means the message exists.
+
+        Passing every id in one call is what keeps an album together; sending
+        them one by one would split it into separate messages.
         """
         await self.ensure_session()
         driver = self._require_driver()
         ids = [int(i) for i in message_ids]
-        from_id = int(str(from_peer_id).lstrip("@"))
-        to_id = int(str(to_peer_id).lstrip("@"))
+        from_id = _numeric_peer_id(from_peer_id, "source channel")
+        to_id = _numeric_peer_id(to_peer_id, "destination group")
 
         def _forward() -> Any:
             script = """
-            const toPeer = arguments[0];
-            const fromPeer = arguments[1];
+            const fromPeer = arguments[0];
+            const toPeer = arguments[1];
             const ids = arguments[2];
             const done = arguments[3];
-            try {
-              const pending = appMessagesManager.forwardMessages(toPeer, fromPeer, ids.slice());
-              Promise.resolve(pending)
-                .then(r => done({ok: true, result: (r && r._) || 'ok'}))
-                .catch(e => done({
+            (async () => {
+              try {
+                // A destination the client has not loaded yet builds a bogus
+                // input peer and the server answers PEER_ID_INVALID, which is
+                // indistinguishable from never having joined. Load the dialog
+                // list once so the peer is known before deciding anything.
+                let known = null;
+                try { known = appPeersManager.getPeer(toPeer); } catch (e) {}
+                if (!known || !known._ || known._ === 'chatEmpty') {
+                  for (const folder of [0, 1]) {
+                    try {
+                      await apiManager.invokeApi('messages.getDialogs', {
+                        offset_date: 0, offset_id: 0, offset_peer: {_: 'inputPeerEmpty'},
+                        limit: 100, hash: 0, folder_id: folder});
+                    } catch (e) { /* the send below is the real test */ }
+                  }
+                }
+                // random_id must be unique per message or the server treats a
+                // repeat as a duplicate send and silently drops it.
+                const randomIds = ids.map(() => {
+                  if (typeof randomLong === 'function') return randomLong();
+                  return String(Date.now()) + String(Math.floor(Math.random() * 1e9));
+                });
+                const res = await apiManager.invokeApi('messages.forwardMessages', {
+                  from_peer: appPeersManager.getInputPeerById(fromPeer),
+                  id: ids.slice(),
+                  random_id: randomIds,
+                  to_peer: appPeersManager.getInputPeerById(toPeer),
+                  silent: false,
+                  background: false,
+                  drop_author: false,
+                  drop_media_captions: false
+                });
+                const updates = (res && res.updates) ? res.updates.map(u => u._) : [];
+                // The server answers an accepted forward with the new message
+                // itself; anything else means nothing was actually posted.
+                const delivered = updates.some(u =>
+                  u === 'updateNewMessage' || u === 'updateNewChannelMessage' ||
+                  u === 'updateMessageID');
+                if (!delivered) {
+                  done({ok: false, error: 'server returned no new-message update: ' + updates.join(',')});
+                  return;
+                }
+                done({ok: true, result: (res && res._) || 'ok', updates: updates});
+              } catch (e) {
+                done({
                   ok: false,
-                  error: (e && (e.text || e.type || e.message)) || JSON.stringify(e) || String(e)
-                }));
-            } catch (e) {
-              done({ok: false, error: String(e && e.message || e)});
-            }
+                  error: (e && (e.type || e.error_message || e.text || e.message)) ||
+                         JSON.stringify(e, Object.getOwnPropertyNames(e || {})) || String(e)
+                });
+              }
+            })();
             """
-            return driver.execute_async_script(script, to_id, from_id, ids)
+            return driver.execute_async_script(script, from_id, to_id, ids)
 
         try:
             result = await self._run(_forward, op="forward", chat_id=str(to_peer_id))
@@ -536,12 +771,16 @@ class WebTransport:
                     "CHAT_ADMIN_REQUIRED",
                     "USER_BANNED",
                     "CHANNEL_PRIVATE",
-                    "PEER_ID_INVALID",
+                    # PEER_ID_INVALID is deliberately absent: the web client
+                    # returns it for any peer it has not loaded yet, so
+                    # treating it as permanent disabled 59 groups in one run
+                    # that the server had just confirmed the account was in.
+                    # It still fails after the normal retries.
                     "USER_KICKED",
                     "CHANNEL_INVALID",
                     "USER_IS_BLOCKED",
-                    "CHAT_ID_INVALID",
-                    "USER_NOT_PARTICIPANT",
+                    "MESSAGE_ID_INVALID",
+                    "INPUT_USER_DEACTIVATED",
                 )
             )
             raise EitaaError(f"forward failed: {error}", permanent=permanent)
