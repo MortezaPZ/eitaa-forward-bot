@@ -1,0 +1,9 @@
+{
+  "composer": "div.input-message-input:not(.input-field-input-fake)",
+  "send_button": "button.btn-send",
+  "file_input": "input[type='file']",
+  "chat_list_item": "li.chatlist-chat",
+  "app_root": "#page-chats",
+  "auth_page": "#auth-pages",
+  "attach_confirm": "button.btn-primary"
+}

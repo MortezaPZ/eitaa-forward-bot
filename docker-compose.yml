@@ -1,0 +1,21 @@
+# LEGACY: only relevant to TRANSPORT=http mode on Linux. Production uses TRANSPORT=web on Windows — see WINDOWS_DEPLOY.md
+services:
+  eitaa-bot:
+    build: .
+    image: eitaa-forwarder:latest
+    container_name: eitaa-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:///./data/bot.db
+      FILES_DIR: ./data/files
+      LOG_FILE: ./data/logs/bot.log
+    volumes:
+      - ./data:/app/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

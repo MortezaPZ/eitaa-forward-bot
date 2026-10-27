@@ -1,0 +1,29 @@
+# LEGACY: only relevant to TRANSPORT=http mode on Linux. Production uses TRANSPORT=web on Windows — see WINDOWS_DEPLOY.md
+[Unit]
+Description=Eitaa channel-to-groups forwarder bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eitaa
+Group=eitaa
+WorkingDirectory=/opt/eitaa-bot
+EnvironmentFile=/opt/eitaa-bot/.env
+ExecStart=/opt/eitaa-bot/venv/bin/python -u /opt/eitaa-bot/main.py
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=eitaa-bot
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/eitaa-bot/data
+
+[Install]
+WantedBy=multi-user.target
