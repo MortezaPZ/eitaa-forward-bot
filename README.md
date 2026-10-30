@@ -175,7 +175,3 @@ The offline suite is `pytest`. A full Selenium run needs a logged-in desktop ses
 - Posts created with `manage.py publish` have no source message ids, so their album parts are sent separately.
 - Chromedriver downloads are geo-blocked from Iran. The working browser is Microsoft Edge, and `msedgedriver` must match the installed Edge version.
 - `tzdata` is required on Windows.
-
-## License
-
-See the repository license file if one is present.

@@ -10,7 +10,7 @@ Only makes sense for the web/account transport: forwarding a real message by
 id requires the account to actually be a member and able to see it, which is
 exactly what web_ingest.py already captures via `Post.message_id` (positive,
 real channel message ids) and `Post.source_chat_id`. The eitaayar/bot API has
-no forward endpoint at all (see HANDOFF.md), so this stays inert there.
+no forward endpoint in this mode, so this path stays inactive.
 
 Dispatch only creates rows in `repeat_items` (see db.py) — actually sending
 them is queue_worker.QueueWorker.repeat_sender_loop, which shares the same

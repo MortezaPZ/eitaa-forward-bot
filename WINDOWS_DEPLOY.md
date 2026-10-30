@@ -5,7 +5,7 @@ Production for this project is Windows Server, Microsoft Edge, and Selenium. The
 ## Requirements
 
 - Python 3.11+ and a `.venv`
-- Microsoft Edge and an `msedgedriver.exe` of the same version (see `HANDOFF.md`, section 7)
+- Microsoft Edge and an msedgedriver.exe matching the installed Edge version; set CHROMEDRIVER_PATH in the local .env file.
 - `.env` with `TRANSPORT=web` and `BROWSER=edge`
 
 ## 1. First login

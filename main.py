@@ -55,7 +55,7 @@ async def run(stop_event: asyncio.Event | None = None) -> int:
     if is_web:
         # No push channel exists for a browser session: polling replaces
         # long-polling getUpdates, and in-app admin commands are unavailable
-        # (use manage.py). See web_ingest.py / HANDOFF.md section 9.
+        # (use manage.py). See web_ingest.py for ingestion details.
         ingestor: Ingestor | WebIngestor = WebIngestor(client, settings)
         router = None
     else:
